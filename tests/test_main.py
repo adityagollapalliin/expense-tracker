@@ -16,7 +16,8 @@ from flet.messaging.protocol import configure_encode_object_for_msgpack
 from flet.messaging.session import Session
 
 from main import (
-    CATEGORIES, ExpenseRepository, ExpenseTracker, format_inr, main, parse_amount, parse_date,
+    CATEGORIES, ExpenseRepository, ExpenseTracker, category_totals, format_inr,
+    main, parse_amount, parse_date,
 )
 
 
@@ -220,6 +221,37 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(self.repo.get_budget(), 10000)
         self.assertIn("Could not save the budget", app.status.value)
 
+    def test_category_breakdown_groups_all_dates_and_loads_on_restart(self):
+        self.repo.add(10, "AI", date(2025, 1, 1), "Older")
+        self.repo.add(20, "AI", date(2026, 9, 12), "Newer")
+        self.repo.add(70, "Cloud", date(2026, 9, 12), "Cloud")
+        totals = category_totals(self.repo.list_all())
+        self.assertEqual(list(totals), list(CATEGORIES))
+        self.assertEqual(totals["AI"], 30)
+        self.assertEqual(totals["Cloud"], 70)
+        self.assertEqual(totals["Food"], 0)
+        app = ExpenseTracker(Mock(spec=ft.Page), ExpenseRepository(self.path))
+        app.build()
+        self.assertIsNone(self.repo.get_budget())
+        self.assertTrue(app.spending_chart.visible)
+        self.assertFalse(app.chart_empty.visible)
+        self.assertEqual(app.category_amounts["AI"].value, "₹0.30")
+        self.assertEqual(app.category_percentages["AI"].value, "30.0%")
+        self.assertEqual(app.category_percentages["Cloud"].value, "70.0%")
+        self.assertEqual(app.category_percentages["Food"].value, "0.0%")
+        app.budget_amount.value = "500.00"
+        app.save_budget(None)
+        self.assertEqual(app.category_percentages["AI"].value, "30.0%")
+
+    def test_tiny_category_share_still_has_exact_amount(self):
+        self.repo.add(1, "Repairs", date.today(), "Tiny expense")
+        self.repo.add(10000, "General", date.today(), "Larger expense")
+        app = ExpenseTracker(Mock(spec=ft.Page), self.repo)
+        app.build()
+        self.assertEqual(app.category_amounts["Repairs"].value, "₹0.01")
+        self.assertEqual(app.category_percentages["Repairs"].value, "<0.1%")
+        self.assertEqual(len(app.spending_chart.sections), 2)
+
 
 class FletStartupTests(unittest.IsolatedAsyncioTestCase):
     async def test_mounted_page_startup_and_budget_updates(self):
@@ -242,6 +274,8 @@ class FletStartupTests(unittest.IsolatedAsyncioTestCase):
             payload = msgpack.packb(session.get_page_patch(), default=encode)
             self.assertTrue(payload)
             self.assertIn("No budget set", app.progress.semantics_label)
+            self.assertFalse(app.spending_chart.visible)
+            self.assertTrue(app.chart_empty.visible)
 
             app.budget_amount.value = "100.00"
             app.save_budget(None)
@@ -249,12 +283,34 @@ class FletStartupTests(unittest.IsolatedAsyncioTestCase):
             app.add_expense(None)
             self.assertEqual(app.remaining.value, "−₹25.00")
             self.assertIn("125.0%", app.progress.semantics_label)
+            self.assertTrue(app.spending_chart.visible)
+            self.assertEqual(app.category_percentages["General"].value, "100.0%")
 
             app.budget_amount.value = "0"
             app.save_budget(None)
             self.assertIn("No funds available", app.progress.semantics_label)
             app.delete_expense(repository.list_all()[0])
             self.assertEqual(app.progress.value, 0)
+            self.assertEqual(app.spending_chart.sections, [])
+            self.assertTrue(app.chart_empty.visible)
+            self.assertEqual(app.category_amounts["General"].value, "₹0.00")
+
+            # Mounted charts must serialize correctly as categories appear,
+            # aggregate, and change after deletion.
+            for category, amount in [("Food", "75"), ("Cloud", "25"), ("Food", "25")]:
+                app.category.value = category
+                app.amount.value = amount
+                app.add_expense(None)
+            self.assertEqual(
+                {section.key: section.value for section in app.spending_chart.sections},
+                {"Cloud": 2500, "Food": 10000},
+            )
+            self.assertEqual(app.category_amounts["Food"].value, "₹100.00")
+            self.assertEqual(app.category_percentages["Food"].value, "80.0%")
+            app.delete_expense(repository.list_all()[0])
+            self.assertEqual(app.category_amounts["Food"].value, "₹75.00")
+            self.assertEqual(app.category_percentages["Food"].value, "75.0%")
+            self.assertEqual(app.category_percentages["Cloud"].value, "25.0%")
             self.assertTrue(connection.send_message.called)
 
 

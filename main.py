@@ -12,6 +12,7 @@ from decimal import Decimal
 from pathlib import Path
 
 import flet as ft
+import flet_charts as fch
 
 CATEGORIES = ("Cloud", "AI", "Utilities", "Fuel", "Repairs", "Food", "General")
 DB_PATH = Path(__file__).resolve().with_name("expenses.db")
@@ -19,6 +20,10 @@ MAX_AMOUNT_PAISE = 99_999_999_999  # ₹99,99,99,999.99 per expense
 TEAL = "#087F72"
 INK = "#173B37"
 MUTED = "#647773"
+CATEGORY_COLORS = {
+    "Cloud": "#3976C6", "AI": "#8957B8", "Utilities": "#D19422",
+    "Fuel": "#D16A3C", "Repairs": "#BD5274", "Food": TEAL, "General": MUTED,
+}
 
 
 def parse_amount(value: str, *, allow_zero: bool = False) -> int:
@@ -63,6 +68,14 @@ class Expense:
     category: str
     spent_on: date
     description: str
+
+
+def category_totals(expenses: list[Expense]) -> dict[str, int]:
+    """Group expenses in category order, keeping exact totals in paise."""
+    totals = dict.fromkeys(CATEGORIES, 0)
+    for expense in expenses:
+        totals[expense.category] += expense.amount_paise
+    return totals
 
 
 class ExpenseRepository:
@@ -200,6 +213,23 @@ class ExpenseTracker:
             value=0, color=TEAL, bgcolor="#DDEFE9", bar_height=12,
             border_radius=6, semantics_label="Budget utilized",
         )
+        self.spending_chart = fch.PieChart(
+            sections=[], width=260, height=260, center_space_radius=55,
+            sections_space=2, start_degree_offset=270, visible=False,
+        )
+        self.chart_empty = ft.Text(
+            "No spending yet.\nAdd an expense to see your category breakdown.",
+            color=MUTED, text_align=ft.TextAlign.CENTER,
+        )
+        self.category_amounts = {
+            category: ft.Text(format_inr(0), color=INK,
+                              weight=ft.FontWeight.W_600, selectable=True)
+            for category in CATEGORIES
+        }
+        self.category_percentages = {
+            category: ft.Text("0.0%", color=MUTED, size=12)
+            for category in CATEGORIES
+        }
 
     @staticmethod
     def panel(content: ft.Control, col: dict) -> ft.Container:
@@ -310,6 +340,7 @@ class ExpenseTracker:
                         color=INK),
                 self.progress, self.utilization,
             ], spacing=16), {"xs": 12}),
+            self.build_spending_breakdown(),
             self.panel(ft.Column([
                 ft.Text("Set or update your budget", size=20,
                         weight=ft.FontWeight.BOLD, color=INK),
@@ -323,6 +354,55 @@ class ExpenseTracker:
                 ),
             ], spacing=16), {"xs": 12}),
         ], spacing=20, scroll=ft.ScrollMode.AUTO)
+
+    def build_spending_breakdown(self) -> ft.Container:
+        legend = ft.Column([
+            ft.Row([
+                ft.Container(width=12, height=12, border_radius=6,
+                             bgcolor=CATEGORY_COLORS[category]),
+                ft.Column([
+                    ft.Text(category, color=INK), self.category_percentages[category],
+                ], spacing=2, expand=True),
+                self.category_amounts[category],
+            ], spacing=12)
+            for category in CATEGORIES
+        ], spacing=12)
+        return self.panel(ft.Column([
+            ft.Text("Spending by category", size=20,
+                    weight=ft.FontWeight.BOLD, color=INK),
+            ft.Text("All time · Percentages show each category’s share of total spending.",
+                    color=MUTED, size=13),
+            ft.ResponsiveRow([
+                ft.Container(
+                    content=ft.Column(
+                        [self.spending_chart, self.chart_empty],
+                        horizontal_alignment=ft.CrossAxisAlignment.CENTER,
+                        alignment=ft.MainAxisAlignment.CENTER,
+                    ),
+                    height=300, col={"xs": 12, "md": 5},
+                ),
+                ft.Container(content=legend, col={"xs": 12, "md": 7}),
+            ], spacing=24, run_spacing=16,
+                vertical_alignment=ft.CrossAxisAlignment.CENTER),
+        ], spacing=16), {"xs": 12})
+
+    def update_spending_breakdown(self, expenses: list[Expense]) -> None:
+        totals = category_totals(expenses)
+        total = sum(totals.values())
+        self.spending_chart.sections = [
+            fch.PieChartSection(
+                key=category, value=amount, color=CATEGORY_COLORS[category],
+                radius=45, title="",
+            )
+            for category, amount in totals.items() if amount > 0
+        ]
+        self.spending_chart.visible = total > 0
+        self.chart_empty.visible = total == 0
+        for category, amount in totals.items():
+            percentage = Decimal(amount) * 100 / Decimal(total) if total else Decimal(0)
+            label = "<0.1%" if 0 < percentage < Decimal("0.1") else f"{percentage:.1f}%"
+            self.category_amounts[category].value = format_inr(amount)
+            self.category_percentages[category].value = label
 
     def save_budget(self, _event: ft.Event) -> None:
         self.budget_amount.error = None
@@ -476,6 +556,7 @@ class ExpenseTracker:
         spent = sum(item.amount_paise for item in expenses)
         self.total.value = format_inr(spent)
         self.update_budget_summary(budget, spent)
+        self.update_spending_breakdown(expenses)
         if update_budget_input:
             self.budget_amount.value = (
                 f"{budget // 100}.{budget % 100:02d}" if budget is not None else ""

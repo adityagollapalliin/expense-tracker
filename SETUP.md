@@ -17,6 +17,11 @@ launches use the installed runtime and local SQLite database.
 - **Budget:** Enter your total available funds and click **Save budget** (or press
   Return). Saving replaces the previous total; it does not add to it. The dashboard
   shows Total Budget, Total Spent, Remaining Balance, and budget utilization.
+- **Spending by category:** The Budget tab includes a donut chart and a legend
+  showing ₹ totals and each category's percentage of all-time spending. All seven
+  categories stay in the legend, including those with zero spending. The chart
+  updates when expenses are added or deleted and works without a saved budget.
+  Before the first expense, an empty-state message replaces the chart.
 - The budget applies to **all recorded expenses across all dates**. Adding or
   deleting an expense updates both screens immediately. Existing expenses count
   toward the budget as soon as it is set.
@@ -36,6 +41,14 @@ Close the app before copying `expenses.db` for a backup.
 The pinned Flet 0.86.5 dependency uses
 [Tabs, TabBar, and TabBarView](https://flet.dev/docs/controls/tabs/).
 Each tab scrolls independently within the available window height.
+The chart uses Flet's official
+[flet-charts PieChart](https://flet.dev/docs/controls/charts/piechart/) package.
+After updating an existing installation, install the new dependency and restart:
+
+```sh
+python -m pip install -r requirements.txt
+python main.py
+```
 
 Run the automated checks (temporary databases only):
 
