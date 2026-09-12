@@ -253,6 +253,142 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(app.category_percentages["Repairs"].value, "<0.1%")
         self.assertEqual(len(app.spending_chart.sections), 2)
 
+    def test_theme_toggle_persists_and_preserves_drafts_and_selected_tab(self):
+        app = ExpenseTracker(Mock(spec=ft.Page), self.repo)
+        app.build()
+        self.assertEqual(app.page.theme_mode, ft.ThemeMode.LIGHT)
+        self.assertEqual(app.theme_toggle.icon, ft.Icons.DARK_MODE_OUTLINED)
+        app.amount.value = "125.50"
+        app.category.value = "AI"
+        app.description.value = "Unsaved expense"
+        app.budget_amount.value = "5000"
+        app.tabs.selected_index = 1
+        original_tabs = app.tabs
+        app.toggle_theme(None)
+        self.assertEqual(app.page.theme_mode, ft.ThemeMode.DARK)
+        self.assertEqual(app.theme_toggle.icon, ft.Icons.LIGHT_MODE_OUTLINED)
+        self.assertEqual(app.theme_toggle.tooltip, "Switch to light mode")
+        self.assertIs(app.tabs, original_tabs)
+        self.assertEqual(app.tabs.selected_index, 1)
+        self.assertEqual(app.amount.value, "125.50")
+        self.assertEqual(app.category.value, "AI")
+        self.assertEqual(app.description.value, "Unsaved expense")
+        self.assertEqual(app.budget_amount.value, "5000")
+        self.assertEqual(self.repo.list_all(), [])
+        self.assertIsNone(self.repo.get_budget())
+
+        reopened = ExpenseRepository(self.path)
+        self.assertEqual(reopened.get_theme(), "dark")
+        restarted = ExpenseTracker(Mock(spec=ft.Page), reopened)
+        restarted.build()
+        self.assertEqual(restarted.page.theme_mode, ft.ThemeMode.DARK)
+        self.assertEqual(restarted.theme_toggle.icon, ft.Icons.LIGHT_MODE_OUTLINED)
+        restarted.toggle_theme(None)
+        self.assertEqual(restarted.page.theme_mode, ft.ThemeMode.LIGHT)
+        self.assertEqual(restarted.theme_toggle.tooltip, "Switch to dark mode")
+        self.assertEqual(ExpenseRepository(self.path).get_theme(), "light")
+
+    def test_theme_migration_preserves_expenses_and_budget(self):
+        self.repo.add(100, "Food", date.today(), "Existing")
+        self.repo.set_budget(5000)
+        original = self.repo.list_all()
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("DROP TABLE preferences")
+        migrated = ExpenseRepository(self.path)
+        self.assertEqual(migrated.get_theme(), "light")
+        migrated.set_theme("dark")
+        self.assertEqual(migrated.get_budget(), 5000)
+        self.assertEqual(migrated.list_all(), original)
+        with self.assertRaises(ValueError):
+            migrated.set_theme("invalid")
+        self.assertEqual(migrated.get_theme(), "dark")
+
+    def test_theme_storage_errors_keep_app_usable(self):
+        app = ExpenseTracker(Mock(spec=ft.Page), self.repo)
+        with patch.object(self.repo, "get_theme", side_effect=sqlite3.OperationalError("locked")), \
+                self.assertLogs(level="ERROR"):
+            app.build()
+        self.assertEqual(app.page.theme_mode, ft.ThemeMode.LIGHT)
+        self.assertIn("Could not load your theme", app.status.value)
+        with patch.object(self.repo, "set_theme", side_effect=sqlite3.OperationalError("locked")), \
+                self.assertLogs(level="ERROR"):
+            app.toggle_theme(None)
+        self.assertEqual(app.page.theme_mode, ft.ThemeMode.DARK)
+        self.assertEqual(self.repo.get_theme(), "light")
+        self.assertIn("could not be saved", app.status.value)
+
+    def test_expense_snackbar_thresholds_and_progress_color(self):
+        warning = "Warning: You have used 80% of your budget!"
+        alert = "Alert: You have exceeded your budget for this month!"
+        cases = [
+            (10000, 7999, "Expense added.", ft.Colors.PRIMARY),
+            (10000, 8000, warning, "#FFD54F"),
+            (10000, 8001, warning, "#FFD54F"),
+            (10000, 10000, warning, "#FFD54F"),
+            (10000, 10001, alert, "#B3261E"),
+            (None, 10001, "Expense added.", ft.Colors.PRIMARY),
+            (0, 1, alert, "#B3261E"),
+            (3, 2, "Expense added.", ft.Colors.PRIMARY),
+            (3, 3, warning, "#FFD54F"),
+        ]
+        for index, (budget, spent, message, color) in enumerate(cases):
+            with self.subTest(budget=budget, spent=spent):
+                repo = ExpenseRepository(self.path.with_name(f"alert-{index}.db"))
+                if budget is not None:
+                    repo.set_budget(budget)
+                if spent > 1:
+                    repo.add(spent - 1, "AI", date(2025, 1, 1), "Previous spending")
+                page = Mock(spec=ft.Page)
+                app = ExpenseTracker(page, repo)
+                app.build()
+                page.show_dialog.assert_not_called()
+                app.amount.value = "0.01"
+                app.add_expense(None)
+                page.show_dialog.assert_called_once_with(app.expense_snackbar)
+                self.assertIsInstance(app.expense_snackbar, ft.SnackBar)
+                self.assertEqual(app.expense_snackbar.content.value, message)
+                self.assertEqual(app.expense_snackbar.bgcolor, color)
+                self.assertEqual(app.progress.color,
+                                 ft.Colors.ERROR if budget is not None and spent > budget
+                                 else ft.Colors.PRIMARY)
+
+    def test_alert_repeats_on_add_but_not_on_other_changes(self):
+        self.repo.set_budget(10000)
+        page = Mock(spec=ft.Page)
+        app = ExpenseTracker(page, self.repo)
+        app.build()
+        for amount in ["80", "1"]:
+            app.amount.value = amount
+            app.add_expense(None)
+            self.assertEqual(app.expense_snackbar.content.value,
+                             "Warning: You have used 80% of your budget!")
+        self.assertEqual(page.show_dialog.call_count, 2)
+        app.amount.value = "20"
+        app.add_expense(None)
+        self.assertEqual(app.progress.color, ft.Colors.ERROR)
+        self.assertEqual(page.show_dialog.call_count, 3)
+        app.delete_expense(self.repo.list_all()[0])
+        self.assertEqual(app.progress.color, ft.Colors.PRIMARY)
+        app.budget_amount.value = "200"
+        app.save_budget(None)
+        app.toggle_theme(None)
+        app.refresh()
+        self.assertEqual(page.show_dialog.call_count, 3)
+
+    def test_failed_or_invalid_expense_does_not_show_snackbar(self):
+        self.repo.set_budget(100)
+        page = Mock(spec=ft.Page)
+        app = ExpenseTracker(page, self.repo)
+        app.build()
+        app.amount.value = "invalid"
+        app.add_expense(None)
+        app.amount.value = "100"
+        with patch.object(self.repo, "add", side_effect=sqlite3.OperationalError("locked")), \
+                self.assertLogs(level="ERROR"):
+            app.add_expense(None)
+        page.show_dialog.assert_not_called()
+        self.assertEqual(self.repo.list_all(), [])
+
 
 class FletStartupTests(unittest.IsolatedAsyncioTestCase):
     async def test_mounted_page_startup_and_budget_updates(self):
@@ -274,6 +410,10 @@ class FletStartupTests(unittest.IsolatedAsyncioTestCase):
             # Flet validates the entire control tree during client registration.
             payload = msgpack.packb(session.get_page_patch(), default=encode)
             self.assertTrue(payload)
+            app.toggle_theme(None)
+            self.assertEqual(session.page.theme_mode, ft.ThemeMode.DARK)
+            app.toggle_theme(None)
+            self.assertEqual(session.page.theme_mode, ft.ThemeMode.LIGHT)
             self.assertIn("No budget set", app.progress.semantics_label)
             self.assertFalse(app.spending_chart.visible)
             self.assertTrue(app.chart_empty.visible)
@@ -312,6 +452,22 @@ class FletStartupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.category_amounts["Food"].value, "₹75.00")
             self.assertEqual(app.category_percentages["Food"].value, "75.0%")
             self.assertEqual(app.category_percentages["Cloud"].value, "25.0%")
+            app.budget_amount.value = "125"
+            app.save_budget(None)
+            previous_notice = app.expense_snackbar
+            app.amount.value = "1"
+            app.add_expense(None)
+            warning_notice = app.expense_snackbar
+            self.assertFalse(previous_notice.open)
+            self.assertTrue(warning_notice.open)
+            self.assertEqual(warning_notice.content.value,
+                             "Warning: You have used 80% of your budget!")
+            app.amount.value = "30"
+            app.add_expense(None)
+            self.assertFalse(warning_notice.open)
+            self.assertTrue(app.expense_snackbar.open)
+            self.assertEqual(app.expense_snackbar.content.value,
+                             "Alert: You have exceeded your budget for this month!")
             self.assertTrue(connection.send_message.called)
 
 

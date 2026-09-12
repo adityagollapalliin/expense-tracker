@@ -20,12 +20,32 @@ CATEGORIES = ("Cloud", "AI", "Utilities", "Fuel", "Repairs", "Food", "General")
 DB_PATH = Path(__file__).resolve().with_name("expenses.db")
 MAX_AMOUNT_PAISE = 99_999_999_999  # ₹99,99,99,999.99 per expense
 TEAL = "#087F72"
-INK = "#173B37"
-MUTED = "#647773"
+INK = ft.Colors.ON_SURFACE
+MUTED = ft.Colors.ON_SURFACE_VARIANT
 CATEGORY_COLORS = {
     "Cloud": "#3976C6", "AI": "#8957B8", "Utilities": "#D19422",
-    "Fuel": "#D16A3C", "Repairs": "#BD5274", "Food": TEAL, "General": MUTED,
+    "Fuel": "#D16A3C", "Repairs": "#BD5274", "Food": TEAL, "General": "#647773",
 }
+
+
+def app_theme(*, dark: bool) -> ft.Theme:
+    """Use semantic colors so existing controls adapt without being rebuilt."""
+    return ft.Theme(
+        color_scheme_seed=TEAL,
+        color_scheme=ft.ColorScheme(
+            primary="#7ED7C5" if dark else TEAL,
+            on_primary="#00382E" if dark else "#FFFFFF",
+            primary_container="#214A40" if dark else "#DDEFE9",
+            on_primary_container="#ABEFDD" if dark else "#005047",
+            surface="#101C1A" if dark else "#F0F5F2",
+            surface_container_lowest="#172522" if dark else "#FFFFFF",
+            surface_container_low="#1F302C" if dark else "#F6F9F7",
+            on_surface="#E2EEE9" if dark else "#173B37",
+            on_surface_variant="#ADC2B9" if dark else "#647773",
+            outline_variant="#3D534B" if dark else "#E1EAE7",
+            error="#FFB4AB" if dark else "#B3261E",
+        ),
+    )
 
 
 def parse_amount(value: str, *, allow_zero: bool = False) -> int:
@@ -111,6 +131,26 @@ class ExpenseRepository:
                     )
                 )"""
             )
+            connection.execute(
+                """CREATE TABLE IF NOT EXISTS preferences (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    theme TEXT NOT NULL CHECK(theme IN ('light', 'dark'))
+                )"""
+            )
+
+    def get_theme(self) -> str:
+        with closing(self._connect()) as connection:
+            row = connection.execute("SELECT theme FROM preferences WHERE id = 1").fetchone()
+        return row["theme"] if row else "light"
+
+    def set_theme(self, theme: str) -> None:
+        if theme not in ("light", "dark"):
+            raise ValueError("Theme must be light or dark.")
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "INSERT INTO preferences(id, theme) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET theme = excluded.theme", (theme,),
+            )
 
     def get_budget(self) -> int | None:
         """Return the all-time budget in paise, or None before it is set."""
@@ -189,6 +229,10 @@ class ExpenseTracker:
     def __init__(self, page: ft.Page, repository: ExpenseRepository):
         self.page = page
         self.repository = repository
+        self.theme_toggle = ft.IconButton(
+            icon=ft.Icons.DARK_MODE_OUTLINED, tooltip="Switch to dark mode",
+            icon_color=ft.Colors.PRIMARY, on_click=self.toggle_theme,
+        )
         self.amount = ft.TextField(
             label="Amount", prefix="₹ ", hint_text="0.00",
             keyboard_type=ft.KeyboardType.NUMBER, autofocus=True,
@@ -216,12 +260,13 @@ class ExpenseTracker:
         self.history_count = ft.Text("", color=MUTED, size=12)
         self.history = ft.ListView(height=470, spacing=10)
         self.status = ft.Text("", size=13, visible=False)
+        self.expense_snackbar: ft.SnackBar | None = None
         self.file_picker = ft.FilePicker()
         self.export_button = ft.OutlinedButton(
             content="Export to CSV", icon=ft.Icons.DOWNLOAD_OUTLINED,
             on_click=self.export_csv,
             tooltip="Export all saved expenses to a CSV file",
-            style=ft.ButtonStyle(color=TEAL),
+            style=ft.ButtonStyle(color=ft.Colors.PRIMARY),
         )
         self.budget_amount = ft.TextField(
             label="Total budget", prefix="₹ ", hint_text="e.g. 25000.00",
@@ -232,10 +277,10 @@ class ExpenseTracker:
         self.budget_spent = ft.Text(size=28, weight=ft.FontWeight.BOLD,
                                     color=INK, selectable=True)
         self.remaining = ft.Text(size=28, weight=ft.FontWeight.BOLD,
-                                 color=TEAL, selectable=True)
+                                 color=ft.Colors.PRIMARY, selectable=True)
         self.utilization = ft.Text(color=MUTED)
         self.progress = ft.ProgressBar(
-            value=0, color=TEAL, bgcolor="#DDEFE9", bar_height=12,
+            value=0, color=ft.Colors.PRIMARY, bgcolor=ft.Colors.PRIMARY_CONTAINER, bar_height=12,
             border_radius=6, semantics_label="Budget utilized",
         )
         self.spending_chart = fch.PieChart(
@@ -259,11 +304,18 @@ class ExpenseTracker:
     @staticmethod
     def panel(content: ft.Control, col: dict) -> ft.Container:
         return ft.Container(
-            content=content, col=col, bgcolor=ft.Colors.WHITE,
-            padding=24, border_radius=20, border=ft.Border.all(1, "#E1EAE7"),
+            content=content, col=col, bgcolor=ft.Colors.SURFACE_CONTAINER_LOWEST,
+            padding=24, border_radius=20, border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
         )
 
     def build(self) -> None:
+        try:
+            self.apply_theme(ft.ThemeMode(self.repository.get_theme()))
+            theme_load_failed = False
+        except sqlite3.Error:
+            logging.exception("Could not load theme preference")
+            self.apply_theme(ft.ThemeMode.LIGHT)
+            theme_load_failed = True
         form = self.panel(
             ft.Column([
                 ft.Text("Add an expense", size=22, weight=ft.FontWeight.BOLD,
@@ -272,14 +324,14 @@ class ExpenseTracker:
                 ft.Container(height=4), self.amount, self.category,
                 ft.Row([self.spent_on, ft.IconButton(
                     icon=ft.Icons.CALENDAR_MONTH_OUTLINED,
-                    tooltip="Choose expense date", icon_color=TEAL,
+                    tooltip="Choose expense date", icon_color=ft.Colors.PRIMARY,
                     on_click=self.open_calendar,
                 )]),
                 self.description,
                 ft.FilledButton(
                     content="Add expense", icon=ft.Icons.ADD_ROUNDED,
                     width=float("inf"), height=48, on_click=self.add_expense,
-                    style=ft.ButtonStyle(bgcolor=TEAL, color=ft.Colors.WHITE),
+                    style=ft.ButtonStyle(bgcolor=ft.Colors.PRIMARY, color=ft.Colors.ON_PRIMARY),
                 ),
             ], spacing=16), {"xs": 12, "md": 5, "lg": 4},
         )
@@ -291,7 +343,7 @@ class ExpenseTracker:
                         self.history_count],
                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
                 self.export_button,
-                ft.Divider(color="#E8EFEC"), self.history,
+                ft.Divider(color=ft.Colors.OUTLINE_VARIANT), self.history,
             ], spacing=14), {"xs": 12, "md": 7, "lg": 8},
         )
         expenses_screen = ft.Column([
@@ -313,7 +365,7 @@ class ExpenseTracker:
                         ft.Tab(label="Expenses", icon=ft.Icons.RECEIPT_LONG_OUTLINED),
                         ft.Tab(label="Budget", icon=ft.Icons.ACCOUNT_BALANCE_WALLET_OUTLINED),
                     ],
-                    label_color=TEAL, indicator_color=TEAL,
+                    label_color=ft.Colors.PRIMARY, indicator_color=ft.Colors.PRIMARY,
                     unselected_label_color=MUTED,
                 ),
                 ft.TabBarView(
@@ -328,14 +380,15 @@ class ExpenseTracker:
                 ft.Row([
                     ft.Container(
                         content=ft.Icon(ft.Icons.ACCOUNT_BALANCE_WALLET_OUTLINED,
-                                        color=TEAL, size=27),
-                        bgcolor="#DDEFE9", padding=13, border_radius=16,
+                                        color=ft.Colors.PRIMARY, size=27),
+                        bgcolor=ft.Colors.PRIMARY_CONTAINER, padding=13, border_radius=16,
                     ),
                     ft.Column([
                         ft.Text("Expense Tracker", size=28,
                                 weight=ft.FontWeight.BOLD, color=INK),
                         ft.Text("Every rupee, accounted for.", color=MUTED, size=14),
                     ], spacing=3, expand=True),
+                    self.theme_toggle,
                 ], spacing=14),
                 self.status,
                 self.tabs,
@@ -344,6 +397,29 @@ class ExpenseTracker:
             ], spacing=24, expand=True),
         ))
         self.refresh(update_budget_input=True)
+        if theme_load_failed:
+            self.notify("Could not load your theme preference. Using light mode.", error=True)
+
+    def apply_theme(self, mode: ft.ThemeMode) -> None:
+        self.page.theme_mode = mode
+        dark = mode == ft.ThemeMode.DARK
+        self.theme_toggle.icon = (
+            ft.Icons.LIGHT_MODE_OUTLINED if dark else ft.Icons.DARK_MODE_OUTLINED
+        )
+        self.theme_toggle.tooltip = "Switch to light mode" if dark else "Switch to dark mode"
+
+    def toggle_theme(self, _event: ft.Event) -> None:
+        mode = (ft.ThemeMode.LIGHT if self.page.theme_mode == ft.ThemeMode.DARK
+                else ft.ThemeMode.DARK)
+        self.apply_theme(mode)
+        try:
+            self.repository.set_theme(mode.value)
+        except sqlite3.Error:
+            logging.exception("Could not save theme preference")
+            self.notify("Theme changed for this session, but the preference could not "
+                        "be saved. Try toggling again to save it.", error=True)
+            return
+        self.page.update()
 
     def build_budget_screen(self) -> ft.Column:
         summary_cards = [
@@ -376,7 +452,7 @@ class ExpenseTracker:
                 ft.FilledButton(
                     content="Save budget", icon=ft.Icons.SAVE_OUTLINED,
                     height=48, on_click=self.save_budget,
-                    style=ft.ButtonStyle(bgcolor=TEAL, color=ft.Colors.WHITE),
+                    style=ft.ButtonStyle(bgcolor=ft.Colors.PRIMARY, color=ft.Colors.ON_PRIMARY),
                 ),
             ], spacing=16), {"xs": 12}),
         ], spacing=20, scroll=ft.ScrollMode.AUTO)
@@ -453,8 +529,8 @@ class ExpenseTracker:
         self.budget_total.value = format_inr(budget or 0)
         self.budget_spent.value = format_inr(spent)
         self.remaining.value = format_inr(remaining)
-        self.remaining.color = "#B3261E" if remaining < 0 else TEAL
-        self.progress.color = "#B3261E" if budget is not None and spent > budget else TEAL
+        self.remaining.color = ft.Colors.ERROR if remaining < 0 else ft.Colors.PRIMARY
+        self.progress.color = ft.Colors.ERROR if budget is not None and spent > budget else ft.Colors.PRIMARY
         if budget is None:
             self.progress.value = 0
             message = "No budget set yet. Save a budget to track utilization."
@@ -511,9 +587,32 @@ class ExpenseTracker:
 
     def notify(self, message: str, error: bool = False) -> None:
         self.status.value = message
-        self.status.color = "#B3261E" if error else TEAL
+        self.status.color = ft.Colors.ERROR if error else ft.Colors.PRIMARY
         self.status.visible = True
         self.page.update()
+
+    def show_expense_snackbar(self, budget: int | None, spent: int) -> None:
+        """Notify after a saved expense using the same totals as the dashboard."""
+        if budget is not None and spent > budget:
+            message = "Alert: You have exceeded your budget for this month!"
+            background, foreground = "#B3261E", "#FFFFFF"
+        elif budget is not None and budget > 0 and spent * 100 >= budget * 80:
+            # Integer paise comparisons avoid rounding around the 80% boundary.
+            message = "Warning: You have used 80% of your budget!"
+            background, foreground = "#FFD54F", "#3A2C00"
+        else:
+            message = "Expense added."
+            background, foreground = ft.Colors.PRIMARY, ft.Colors.ON_PRIMARY
+        # Replace an earlier notice so a new over-budget alert isn't queued behind it.
+        if self.expense_snackbar is not None and self.expense_snackbar.open:
+            self.expense_snackbar.open = False
+            self.page.update()
+        self.expense_snackbar = ft.SnackBar(
+            content=ft.Text(message, color=foreground), bgcolor=background,
+            behavior=ft.SnackBarBehavior.FLOATING, duration=6000,
+            show_close_icon=True, close_icon_color=foreground, persist=False,
+        )
+        self.page.show_dialog(self.expense_snackbar)
 
     def open_calendar(self, _event: ft.Event) -> None:
         try:
@@ -564,7 +663,7 @@ class ExpenseTracker:
             return
         self.amount.value = ""
         self.description.value = ""
-        if self.refresh():
+        if self.refresh(expense_added=True):
             self.notify("Expense added.")
 
     def delete_expense(self, expense: Expense) -> None:
@@ -579,7 +678,7 @@ class ExpenseTracker:
 
     def expense_row(self, expense: Expense) -> ft.Container:
         return ft.Container(
-            bgcolor="#F6F9F7", border_radius=12, padding=14,
+            bgcolor=ft.Colors.SURFACE_CONTAINER_LOW, border_radius=12, padding=14,
             content=ft.Column([
                 ft.Row([
                     ft.Text(expense.category, weight=ft.FontWeight.W_600,
@@ -600,7 +699,8 @@ class ExpenseTracker:
             ], spacing=4),
         )
 
-    def refresh(self, *, update_budget_input: bool = False) -> bool:
+    def refresh(self, *, update_budget_input: bool = False,
+                expense_added: bool = False) -> bool:
         try:
             expenses = self.repository.list_all()
             budget = self.repository.get_budget()
@@ -624,7 +724,7 @@ class ExpenseTracker:
             ft.Container(
                 padding=ft.Padding.symmetric(vertical=70),
                 content=ft.Column([
-                    ft.Icon(ft.Icons.RECEIPT_LONG_OUTLINED, size=44, color=TEAL),
+                    ft.Icon(ft.Icons.RECEIPT_LONG_OUTLINED, size=44, color=ft.Colors.PRIMARY),
                     ft.Text("Your first expense starts here", size=18,
                             weight=ft.FontWeight.W_600, color=INK,
                             text_align=ft.TextAlign.CENTER),
@@ -634,14 +734,17 @@ class ExpenseTracker:
             )
         ]
         self.page.update()
+        if expense_added:
+            self.show_expense_snackbar(budget, spent)
         return True
 
 
 def main(page: ft.Page) -> None:
     page.title = "Expense Tracker"
     page.theme_mode = ft.ThemeMode.LIGHT
-    page.theme = ft.Theme(color_scheme_seed=TEAL)
-    page.bgcolor = "#F0F5F2"
+    page.theme = app_theme(dark=False)
+    page.dark_theme = app_theme(dark=True)
+    page.bgcolor = ft.Colors.SURFACE
     page.padding = 0
     # TabBarView needs bounded height; each tab handles its own scrolling.
     page.scroll = None
@@ -656,7 +759,7 @@ def main(page: ft.Page) -> None:
         logging.exception("Could not open expense database")
         page.add(ft.Container(padding=32, content=ft.Text(
             "Could not open expenses.db. Make sure the app folder is writable, "
-            "then restart the app.", color="#B3261E")))
+            "then restart the app.", color=ft.Colors.ERROR)))
         return
     ExpenseTracker(page, repository).build()
 
