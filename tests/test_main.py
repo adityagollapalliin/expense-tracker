@@ -1,17 +1,22 @@
 """Behavior checks using temporary databases; never touches real expenses."""
 
+import asyncio
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from datetime import date
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import flet as ft
+import msgpack
+from flet.controls.base_control import BaseControl
+from flet.messaging.protocol import configure_encode_object_for_msgpack
+from flet.messaging.session import Session
 
 from main import (
-    CATEGORIES, ExpenseRepository, ExpenseTracker, format_inr, parse_amount, parse_date,
+    CATEGORIES, ExpenseRepository, ExpenseTracker, format_inr, main, parse_amount, parse_date,
 )
 
 
@@ -214,6 +219,43 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(app.budget_total.value, "₹100.00")
         self.assertEqual(self.repo.get_budget(), 10000)
         self.assertIn("Could not save the budget", app.status.value)
+
+
+class FletStartupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mounted_page_startup_and_budget_updates(self):
+        # Use the real mount/validation/serialization path. Mock only the socket.
+        # Constructing controls with Mock(Page) alone misses deferred validation.
+        connection = Mock()
+        connection.loop = asyncio.get_running_loop()
+        encode = configure_encode_object_for_msgpack(BaseControl)
+        connection.send_message.side_effect = lambda message: msgpack.packb(
+            [message.action, message.body], default=encode,
+        )
+        session = Session(connection)
+        with tempfile.TemporaryDirectory() as directory:
+            repository = ExpenseRepository(Path(directory) / "test.db")
+            app = ExpenseTracker(session.page, repository)
+            with patch("main.ExpenseRepository", return_value=repository), \
+                    patch("main.ExpenseTracker", return_value=app):
+                main(session.page)
+            # Flet validates the entire control tree during client registration.
+            payload = msgpack.packb(session.get_page_patch(), default=encode)
+            self.assertTrue(payload)
+            self.assertIn("No budget set", app.progress.semantics_label)
+
+            app.budget_amount.value = "100.00"
+            app.save_budget(None)
+            app.amount.value = "125.00"
+            app.add_expense(None)
+            self.assertEqual(app.remaining.value, "−₹25.00")
+            self.assertIn("125.0%", app.progress.semantics_label)
+
+            app.budget_amount.value = "0"
+            app.save_budget(None)
+            self.assertIn("No funds available", app.progress.semantics_label)
+            app.delete_expense(repository.list_all()[0])
+            self.assertEqual(app.progress.value, 0)
+            self.assertTrue(connection.send_message.called)
 
 
 if __name__ == "__main__":

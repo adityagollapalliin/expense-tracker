@@ -370,7 +370,8 @@ class ExpenseTracker:
             else:
                 message += f" · {format_inr(remaining)} available"
         self.utilization.value = message
-        self.progress.semantics_value = message
+        # Flet's semantics_value is numeric; descriptive text belongs in the label.
+        self.progress.semantics_label = message
 
     def notify(self, message: str, error: bool = False) -> None:
         self.status.value = message
