@@ -1,13 +1,14 @@
 """Behavior checks using temporary databases; never touches real expenses."""
 
 import asyncio
+import csv
 import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
 from datetime import date
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import flet as ft
 import msgpack
@@ -312,6 +313,81 @@ class FletStartupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.category_percentages["Food"].value, "75.0%")
             self.assertEqual(app.category_percentages["Cloud"].value, "25.0%")
             self.assertTrue(connection.send_message.called)
+
+
+class CsvExportTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.folder = Path(self.directory.name)
+        self.repo = ExpenseRepository(self.folder / "test.db")
+        self.app = ExpenseTracker(Mock(spec=ft.Page), self.repo)
+        self.app.build()
+        self.destination = self.folder / "my expenses.csv"
+
+    def read_export(self):
+        with self.destination.open(encoding="utf-8-sig", newline="") as exported:
+            return list(csv.reader(exported))
+
+    async def test_exports_fresh_database_with_exact_values_and_quoting(self):
+        # Add after the UI was built so export cannot rely on cached history.
+        description = 'Lunch, "with friends"\nPaid ₹250 • भोजन'
+        self.repo.add(125050, "Food", date(2025, 1, 1), description)
+        self.repo.add(1, "AI", date(2026, 9, 12), "")
+        original = self.repo.list_all()
+        with patch.object(self.app.file_picker, "save_file", new_callable=AsyncMock,
+                          return_value=str(self.destination)) as picker:
+            await self.app.export_csv(None)
+        picker.assert_awaited_once()
+        self.assertEqual(picker.call_args.kwargs["allowed_extensions"], ["csv"])
+        self.assertEqual(picker.call_args.kwargs["file_type"], ft.FilePickerFileType.CUSTOM)
+        self.assertEqual(self.read_export(), [
+            ["ID", "Amount", "Category", "Date", "Description"],
+            [str(original[0].id), "0.01", "AI", "2026-09-12", ""],
+            [str(original[1].id), "1250.50", "Food", "2025-01-01", description],
+        ])
+        self.assertEqual(self.repo.list_all(), original)
+        self.assertIn("Exported 2 expenses", self.app.status.value)
+        self.assertFalse(self.app.export_button.disabled)
+
+    async def test_empty_database_exports_headers(self):
+        with patch.object(self.app.file_picker, "save_file", new_callable=AsyncMock,
+                          return_value=str(self.destination)):
+            await self.app.export_csv(None)
+        self.assertEqual(self.read_export(), [
+            ["ID", "Amount", "Category", "Date", "Description"],
+        ])
+        self.assertIn("Exported 0 expenses", self.app.status.value)
+
+    async def test_cancel_does_not_query_or_write(self):
+        with patch.object(self.app.file_picker, "save_file", new_callable=AsyncMock,
+                          return_value=None), patch.object(self.repo, "list_all") as query:
+            await self.app.export_csv(None)
+        query.assert_not_called()
+        self.assertFalse(self.destination.exists())
+        self.assertEqual(self.app.status.value, "Export cancelled.")
+        self.assertFalse(self.app.export_button.disabled)
+
+    async def test_failed_write_reports_error_and_reenables_button(self):
+        with patch.object(self.app.file_picker, "save_file", new_callable=AsyncMock,
+                          return_value=str(self.destination)), \
+                patch.object(Path, "open", side_effect=PermissionError("Read only")), \
+                self.assertLogs(level="ERROR"):
+            await self.app.export_csv(None)
+        self.assertIn("Could not export", self.app.status.value)
+        self.assertFalse(self.app.export_button.disabled)
+        self.assertFalse(self.destination.exists())
+
+    async def test_query_failure_preserves_existing_destination(self):
+        self.destination.write_text("Existing export")
+        with patch.object(self.app.file_picker, "save_file", new_callable=AsyncMock,
+                          return_value=str(self.destination)), \
+                patch.object(self.repo, "list_all", side_effect=sqlite3.OperationalError("locked")), \
+                self.assertLogs(level="ERROR"):
+            await self.app.export_csv(None)
+        self.assertEqual(self.destination.read_text(), "Existing export")
+        self.assertIn("Could not export", self.app.status.value)
+        self.assertFalse(self.app.export_button.disabled)
 
 
 if __name__ == "__main__":

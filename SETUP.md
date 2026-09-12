@@ -14,6 +14,13 @@ launches use the installed runtime and local SQLite database.
 
 - **Expenses:** Add an amount, category, date, and optional description. View
   expenses newest first and use the trash icon to delete an entry permanently.
+- **Export to CSV:** Click the button above expense history, choose a file name
+  and location in the macOS save dialog, and click Save. The export reads all
+  currently saved expenses, newest first, with headers `ID, Amount, Category,
+  Date, Description`. Amounts are numeric INR values with two decimal places
+  (for example `1250.50`), and dates use `YYYY-MM-DD`. Unicode descriptions,
+  commas, quotes, and line breaks are preserved. An empty database exports just
+  the header row. Cancelling the dialog creates no file.
 - **Budget:** Enter your total available funds and click **Save budget** (or press
   Return). Saving replaces the previous total; it does not add to it. The dashboard
   shows Total Budget, Total Spent, Remaining Balance, and budget utilization.

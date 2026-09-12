@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import csv
 import logging
 import re
 import sqlite3
@@ -165,6 +167,22 @@ class ExpenseRepository:
             connection.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
 
 
+def export_expenses_csv(repository: ExpenseRepository, path: Path) -> int:
+    """Export a fresh database snapshot, with numeric INR amounts for spreadsheets."""
+    expenses = repository.list_all()
+    # UTF-8 BOM helps spreadsheet apps detect Unicode; csv handles quotes/newlines.
+    with path.open("w", encoding="utf-8-sig", newline="") as output:
+        writer = csv.writer(output)
+        writer.writerow(["ID", "Amount", "Category", "Date", "Description"])
+        for expense in expenses:
+            writer.writerow([
+                expense.id,
+                f"{expense.amount_paise // 100}.{expense.amount_paise % 100:02d}",
+                expense.category, expense.spent_on.isoformat(), expense.description,
+            ])
+    return len(expenses)
+
+
 class ExpenseTracker:
     """Compose the view and coordinate form actions with the repository."""
 
@@ -198,6 +216,13 @@ class ExpenseTracker:
         self.history_count = ft.Text("", color=MUTED, size=12)
         self.history = ft.ListView(height=470, spacing=10)
         self.status = ft.Text("", size=13, visible=False)
+        self.file_picker = ft.FilePicker()
+        self.export_button = ft.OutlinedButton(
+            content="Export to CSV", icon=ft.Icons.DOWNLOAD_OUTLINED,
+            on_click=self.export_csv,
+            tooltip="Export all saved expenses to a CSV file",
+            style=ft.ButtonStyle(color=TEAL),
+        )
         self.budget_amount = ft.TextField(
             label="Total budget", prefix="₹ ", hint_text="e.g. 25000.00",
             keyboard_type=ft.KeyboardType.NUMBER, on_submit=self.save_budget,
@@ -265,6 +290,7 @@ class ExpenseTracker:
                 ft.Row([ft.Text("Newest first", size=13, color=MUTED),
                         self.history_count],
                        alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                self.export_button,
                 ft.Divider(color="#E8EFEC"), self.history,
             ], spacing=14), {"xs": 12, "md": 7, "lg": 8},
         )
@@ -452,6 +478,36 @@ class ExpenseTracker:
         self.utilization.value = message
         # Flet's semantics_value is numeric; descriptive text belongs in the label.
         self.progress.semantics_label = message
+
+    async def export_csv(self, _event: ft.Event) -> None:
+        if self.export_button.disabled:
+            return
+        self.export_button.disabled = True
+        self.status.visible = False
+        self.page.update()
+        try:
+            selected_path = await self.file_picker.save_file(
+                dialog_title="Export expenses to CSV",
+                file_name=f"expenses-{date.today().isoformat()}.csv",
+                file_type=ft.FilePickerFileType.CUSTOM,
+                allowed_extensions=["csv"],
+            )
+            if not selected_path:
+                self.notify("Export cancelled.")
+                return
+            # Query after the dialog closes, and keep disk I/O off the UI loop.
+            count = await asyncio.to_thread(
+                export_expenses_csv, self.repository, Path(selected_path),
+            )
+            self.notify(f"Exported {count} expense{'s' if count != 1 else ''} "
+                        f"to {selected_path}")
+        except (sqlite3.Error, OSError, ft.FletException, TimeoutError):
+            logging.exception("Could not export expenses")
+            self.notify("Could not export expenses. Check the save location "
+                        "and try again.", error=True)
+        finally:
+            self.export_button.disabled = False
+            self.page.update()
 
     def notify(self, message: str, error: bool = False) -> None:
         self.status.value = message

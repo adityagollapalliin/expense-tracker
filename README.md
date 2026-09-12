@@ -5,6 +5,7 @@ A local macOS expense tracker built with Python, Flet, and SQLite.
 - **Expenses:** Add expenses, browse history newest first, and delete incorrect entries.
 - **Budget:** Save a total budget and track spending, remaining balance, and utilization.
 - **Analytics:** View a spending-by-category donut chart with ₹ totals and percentages.
+- **CSV export:** Save all expenses through the native macOS save dialog.
 - Amounts display in Indian Rupees (₹), and data persists locally in `expenses.db`.
 
 ## Run locally
