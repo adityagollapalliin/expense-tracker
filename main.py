@@ -90,6 +90,15 @@ class Expense:
     category: str
     spent_on: date
     description: str
+    subscription_id: int | None = None
+
+
+@dataclass(frozen=True)
+class Subscription:
+    id: int
+    amount_paise: int
+    category: str
+    description: str
 
 
 def category_totals(expenses: list[Expense]) -> dict[str, int]:
@@ -107,6 +116,7 @@ class ExpenseRepository:
         self.path = path
         categories_sql = ", ".join(f"'{category}'" for category in CATEGORIES)
         with closing(self._connect()) as connection, connection:
+            connection.execute("BEGIN IMMEDIATE")
             connection.execute(
                 f"""CREATE TABLE IF NOT EXISTS expenses (
                     id INTEGER PRIMARY KEY,
@@ -137,6 +147,68 @@ class ExpenseRepository:
                     theme TEXT NOT NULL CHECK(theme IN ('light', 'dark'))
                 )"""
             )
+            connection.execute(
+                f"""CREATE TABLE IF NOT EXISTS subscriptions (
+                    id INTEGER PRIMARY KEY,
+                    amount_paise INTEGER NOT NULL
+                        CHECK(amount_paise > 0 AND amount_paise <= {MAX_AMOUNT_PAISE}),
+                    category TEXT NOT NULL CHECK(category IN ({categories_sql})),
+                    description TEXT NOT NULL CHECK(length(description) <= 200),
+                    start_month TEXT NOT NULL,
+                    last_logged_month TEXT NOT NULL,
+                    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0, 1))
+                )"""
+            )
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(expenses)")}
+            if "subscription_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE expenses ADD COLUMN subscription_id INTEGER "
+                    "REFERENCES subscriptions(id)"
+                )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS expense_subscription_month_idx "
+                "ON expenses(subscription_id, substr(spent_on, 1, 7)) "
+                "WHERE subscription_id IS NOT NULL"
+            )
+
+    def list_subscriptions(self) -> list[Subscription]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                "SELECT id, amount_paise, category, description FROM subscriptions "
+                "WHERE active = 1 ORDER BY category, id"
+            ).fetchall()
+        return [Subscription(**dict(row)) for row in rows]
+
+    def stop_subscription(self, subscription_id: int) -> None:
+        with closing(self._connect()) as connection, connection:
+            connection.execute("UPDATE subscriptions SET active = 0 WHERE id = ?",
+                               (subscription_id,))
+
+    def generate_recurring_expenses(self, today: date | None = None) -> int:
+        """Log only the current month, once per active subscription, at startup."""
+        month = (today or date.today()).replace(day=1).isoformat()
+        added = 0
+        with closing(self._connect()) as connection, connection:
+            # Serialize concurrent launches; charges and checkpoints commit together.
+            connection.execute("BEGIN IMMEDIATE")
+            subscriptions = connection.execute(
+                "SELECT * FROM subscriptions WHERE active = 1 "
+                "AND start_month < ? AND last_logged_month < ?", (month, month),
+            ).fetchall()
+            for subscription in subscriptions:
+                result = connection.execute(
+                    "INSERT INTO expenses(amount_paise, category, spent_on, description, "
+                    "subscription_id) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                    (subscription["amount_paise"], subscription["category"], month,
+                     subscription["description"], subscription["id"]),
+                )
+                added += result.rowcount
+                # Keep the checkpoint even if the user later deletes this charge.
+                connection.execute(
+                    "UPDATE subscriptions SET last_logged_month = ? WHERE id = ?",
+                    (month, subscription["id"]),
+                )
+        return added
 
     def get_theme(self) -> str:
         with closing(self._connect()) as connection:
@@ -173,24 +245,35 @@ class ExpenseRepository:
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
         return connection
 
     def add(self, amount_paise: int, category: str, spent_on: date,
-            description: str) -> None:
+            description: str, *, recurring: bool = False) -> None:
         if type(amount_paise) is not int or not 0 < amount_paise <= MAX_AMOUNT_PAISE:
             raise ValueError("Invalid expense amount.")
         if category not in CATEGORIES:
             raise ValueError("Choose one of the available categories.")
         if type(spent_on) is not date:
             raise ValueError("Invalid expense date.")
+        if type(recurring) is not bool:
+            raise ValueError("Recurring must be on or off.")
         description = description.strip()
         if len(description) > 200:
             raise ValueError("Keep the description to 200 characters or fewer.")
         with closing(self._connect()) as connection, connection:
+            subscription_id = None
+            if recurring:
+                month = spent_on.replace(day=1).isoformat()
+                subscription_id = connection.execute(
+                    "INSERT INTO subscriptions(amount_paise, category, description, "
+                    "start_month, last_logged_month) VALUES (?, ?, ?, ?, ?)",
+                    (amount_paise, category, description, month, month),
+                ).lastrowid
             connection.execute(
-                "INSERT INTO expenses(amount_paise, category, spent_on, description) "
-                "VALUES (?, ?, ?, ?)",
-                (amount_paise, category, spent_on.isoformat(), description),
+                "INSERT INTO expenses(amount_paise, category, spent_on, description, "
+                "subscription_id) VALUES (?, ?, ?, ?, ?)",
+                (amount_paise, category, spent_on.isoformat(), description, subscription_id),
             )
 
     def list_all(self) -> list[Expense]:
@@ -199,7 +282,8 @@ class ExpenseRepository:
                 "SELECT * FROM expenses ORDER BY spent_on DESC, id DESC"
             ).fetchall()
         return [Expense(row["id"], row["amount_paise"], row["category"],
-                        date.fromisoformat(row["spent_on"]), row["description"])
+                        date.fromisoformat(row["spent_on"]), row["description"],
+                        row["subscription_id"])
                 for row in rows]
 
     def delete(self, expense_id: int) -> None:
@@ -249,6 +333,12 @@ class ExpenseTracker:
             label="Description (optional)", hint_text="What was it for?",
             multiline=True, min_lines=2, max_lines=3, max_length=200,
         )
+        self.recurring = ft.Switch(
+            label="Recurring", value=False,
+            tooltip="Repeat monthly. Future charges are dated the 1st.",
+        )
+        self.subscriptions = ft.ListView(height=220, spacing=10)
+        self.subscription_count = ft.Text("", size=13, color=MUTED)
         self.picker = ft.DatePicker(
             first_date=datetime(1900, 1, 1), last_date=datetime(2100, 12, 31),
             value=datetime.combine(date.today(), datetime.min.time()),
@@ -308,7 +398,7 @@ class ExpenseTracker:
             padding=24, border_radius=20, border=ft.Border.all(1, ft.Colors.OUTLINE_VARIANT),
         )
 
-    def build(self) -> None:
+    def build(self, *, expense_added: bool = False) -> None:
         try:
             self.apply_theme(ft.ThemeMode(self.repository.get_theme()))
             theme_load_failed = False
@@ -328,6 +418,7 @@ class ExpenseTracker:
                     on_click=self.open_calendar,
                 )]),
                 self.description,
+                self.recurring,
                 ft.FilledButton(
                     content="Add expense", icon=ft.Icons.ADD_ROUNDED,
                     width=float("inf"), height=48, on_click=self.add_expense,
@@ -396,7 +487,7 @@ class ExpenseTracker:
                         size=12, color=MUTED),
             ], spacing=24, expand=True),
         ))
-        self.refresh(update_budget_input=True)
+        self.refresh(update_budget_input=True, expense_added=expense_added)
         if theme_load_failed:
             self.notify("Could not load your theme preference. Using light mode.", error=True)
 
@@ -443,6 +534,13 @@ class ExpenseTracker:
                 self.progress, self.utilization,
             ], spacing=16), {"xs": 12}),
             self.build_spending_breakdown(),
+            self.panel(ft.Column([
+                ft.Text("Subscriptions", size=20, weight=ft.FontWeight.BOLD, color=INK),
+                self.subscription_count,
+                ft.Text("Monthly charges are logged on app launch and dated the 1st.",
+                        color=MUTED, size=13),
+                self.subscriptions,
+            ], spacing=14), {"xs": 12}),
             self.panel(ft.Column([
                 ft.Text("Set or update your budget", size=20,
                         weight=ft.FontWeight.BOLD, color=INK),
@@ -652,7 +750,8 @@ class ExpenseTracker:
             self.page.update()
             return
         try:
-            self.repository.add(amount, self.category.value, spent_on, description)
+            self.repository.add(amount, self.category.value, spent_on, description,
+                                recurring=bool(self.recurring.value))
         except ValueError as error:
             self.notify(str(error), error=True)
             return
@@ -663,6 +762,7 @@ class ExpenseTracker:
             return
         self.amount.value = ""
         self.description.value = ""
+        self.recurring.value = False
         if self.refresh(expense_added=True):
             self.notify("Expense added.")
 
@@ -696,6 +796,36 @@ class ExpenseTracker:
                 ft.Text(expense.description or "No description", size=13,
                         color=MUTED, selectable=True),
                 ft.Text(expense.spent_on.strftime("%d %b %Y"), size=12, color=MUTED),
+                ft.Text("Subscription charge", size=12, color=ft.Colors.PRIMARY,
+                        visible=expense.subscription_id is not None),
+            ], spacing=4),
+        )
+
+    def stop_subscription(self, subscription: Subscription) -> None:
+        try:
+            self.repository.stop_subscription(subscription.id)
+        except sqlite3.Error:
+            logging.exception("Could not stop subscription")
+            self.notify("Could not stop the subscription. Please try again.", error=True)
+            return
+        if self.refresh():
+            self.notify("Subscription stopped. Existing expenses are kept.")
+
+    def subscription_row(self, subscription: Subscription) -> ft.Container:
+        return ft.Container(
+            bgcolor=ft.Colors.SURFACE_CONTAINER_LOW, padding=12, border_radius=12,
+            content=ft.Column([
+                ft.Row([
+                    ft.Text(subscription.category, color=INK,
+                            weight=ft.FontWeight.W_600, expand=True),
+                    ft.Text(f"{format_inr(subscription.amount_paise)} / month", color=INK),
+                    ft.IconButton(
+                        icon=ft.Icons.STOP_CIRCLE_OUTLINED, icon_color=MUTED,
+                        tooltip=f"Stop recurring {subscription.category} charges",
+                        on_click=lambda _event: self.stop_subscription(subscription),
+                    ),
+                ], spacing=8),
+                ft.Text(subscription.description or "No description", color=MUTED, size=13),
             ], spacing=4),
         )
 
@@ -704,15 +834,21 @@ class ExpenseTracker:
         try:
             expenses = self.repository.list_all()
             budget = self.repository.get_budget()
+            subscriptions = self.repository.list_subscriptions()
         except sqlite3.Error:
-            logging.exception("Could not load expenses or budget")
-            self.notify("Could not load expenses or budget. Restart the app to retry.",
+            logging.exception("Could not load expenses, budget, or subscriptions")
+            self.notify("Could not load saved data. Restart the app to retry.",
                         error=True)
             return False
         spent = sum(item.amount_paise for item in expenses)
         self.total.value = format_inr(spent)
         self.update_budget_summary(budget, spent)
         self.update_spending_breakdown(expenses)
+        self.subscription_count.value = f"{len(subscriptions)} active"
+        self.subscriptions.controls = [self.subscription_row(item) for item in subscriptions] or [
+            ft.Text("No active subscriptions. Turn on Recurring when adding an expense.",
+                    color=MUTED),
+        ]
         if update_budget_input:
             self.budget_amount.value = (
                 f"{budget // 100}.{budget % 100:02d}" if budget is not None else ""
@@ -761,7 +897,20 @@ def main(page: ft.Page) -> None:
             "Could not open expenses.db. Make sure the app folder is writable, "
             "then restart the app.", color=ft.Colors.ERROR)))
         return
-    ExpenseTracker(page, repository).build()
+    try:
+        generated = repository.generate_recurring_expenses()
+        recurring_failed = False
+    except sqlite3.Error:
+        logging.exception("Could not generate this month's subscription charges")
+        generated, recurring_failed = 0, True
+    app = ExpenseTracker(page, repository)
+    app.build(expense_added=generated > 0)
+    if recurring_failed:
+        app.notify("Could not log this month's subscriptions. Restart the app to retry.",
+                   error=True)
+    elif generated:
+        app.notify(f"Logged {generated} subscription charge{'s' if generated != 1 else ''} "
+                   "for this month.")
 
 
 if __name__ == "__main__":

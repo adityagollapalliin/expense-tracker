@@ -14,6 +14,25 @@ launches use the installed runtime and local SQLite database.
 
 - **Expenses:** Add an amount, category, date, and optional description. View
   expenses newest first and use the trash icon to delete an entry permanently.
+- **Recurring subscriptions:** Turn on **Recurring** before adding a monthly bill.
+  The initial expense uses your selected date and counts as that subscription's
+  charge for that month. Each recurring entry creates a separate subscription,
+  even if its category, amount, and description match another bill.
+- On launch, an active subscription from an earlier month receives one charge
+  for the **1st of the current month**, if that month has not already been logged.
+  Repeated or simultaneous launches do not duplicate charges. Missed intervening
+  months are not backfilled, and future-dated subscriptions are not billed early.
+  This runs when you launch the app; no background scheduler is required.
+- **Budget → Subscriptions** lists each active bill with its category, description,
+  and monthly ₹ amount. Use its stop icon to disable future charges. This only
+  stops local tracking; it does not cancel anything with the subscription provider.
+  Deleting an expense removes just that charge, not the subscription. A deleted
+  charge is not recreated for the same month; the next month's charge still runs
+  unless you stop the subscription.
+- Startup-generated charges are included in totals, charts, CSV exports, and
+  budget alerts. Existing data is migrated automatically: a nullable
+  `expenses.subscription_id` links recurring charges to the `subscriptions` table.
+  Existing expenses remain non-recurring until a new recurring bill is added.
 - **Appearance:** Click the moon icon in the top right of the header for dark
   mode; click the sun icon to return to light mode. Both tabs, forms, panels,
   and status messages adapt immediately. Draft entries and the selected tab

@@ -3,6 +3,8 @@
 A local macOS expense tracker built with Python, Flet, and SQLite.
 
 - **Expenses:** Add expenses, browse history newest first, and delete incorrect entries.
+- **Subscriptions:** Mark monthly bills as recurring and log missing current-month
+  charges automatically on startup. Manage active subscriptions in the Budget tab.
 - **Budget:** Save a total budget and track spending, remaining balance, and utilization.
 - **Budget alerts:** Expense additions show a yellow warning at 80–100% utilization
   and a red alert above 100%.

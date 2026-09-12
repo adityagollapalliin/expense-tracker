@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
@@ -389,6 +390,126 @@ class RepositoryTests(unittest.TestCase):
         page.show_dialog.assert_not_called()
         self.assertEqual(self.repo.list_all(), [])
 
+    def test_recurring_charge_once_per_month_and_year_rollover(self):
+        self.repo.add(129999, "Cloud", date(2025, 12, 31), "Hosting", recurring=True)
+        original = self.repo.list_all()[0]
+        self.assertIsNotNone(original.subscription_id)
+        self.assertEqual(self.repo.generate_recurring_expenses(date(2025, 12, 31)), 0)
+        self.assertEqual(self.repo.generate_recurring_expenses(date(2026, 1, 18)), 1)
+        charge = self.repo.list_all()[0]
+        self.assertEqual(charge.spent_on, date(2026, 1, 1))
+        self.assertEqual(charge.subscription_id, original.subscription_id)
+        self.assertEqual(charge.amount_paise, 129999)
+        self.assertEqual(charge.description, "Hosting")
+        reopened = ExpenseRepository(self.path)
+        self.assertEqual(reopened.generate_recurring_expenses(date(2026, 1, 31)), 0)
+        self.assertEqual(reopened.generate_recurring_expenses(date(2026, 2, 28)), 1)
+        self.assertEqual(len(reopened.list_all()), 3)
+        self.assertEqual(len(reopened.list_subscriptions()), 1)
+
+    def test_recurring_skips_missed_months_and_future_start_dates(self):
+        self.repo.add(100, "AI", date(2024, 1, 31), "AI", recurring=True)
+        self.repo.add(200, "Cloud", date(2024, 6, 15), "Future", recurring=True)
+        self.repo.add(300, "Food", date(2024, 1, 1), "One-off")
+        self.assertEqual(self.repo.generate_recurring_expenses(date(2024, 3, 20)), 1)
+        rows = self.repo.list_all()
+        self.assertFalse(any(row.spent_on.month == 2 for row in rows))
+        march = [row for row in rows if row.spent_on == date(2024, 3, 1)]
+        self.assertEqual([row.category for row in march], ["AI"])
+        self.assertEqual(len(rows), 4)
+
+    def test_identical_subscriptions_remain_independent(self):
+        for _ in range(2):
+            self.repo.add(100, "AI", date(2026, 8, 1), "Seats", recurring=True)
+        self.assertEqual(len(self.repo.list_subscriptions()), 2)
+        self.assertEqual(self.repo.generate_recurring_expenses(date(2026, 9, 1)), 2)
+        self.assertEqual(self.repo.generate_recurring_expenses(date(2026, 9, 2)), 0)
+        self.assertEqual(len(self.repo.list_all()), 4)
+
+    def test_deleted_charge_stays_deleted_and_stop_keeps_history(self):
+        self.repo.add(100, "AI", date(2026, 8, 15), "Plan", recurring=True)
+        self.repo.generate_recurring_expenses(date(2026, 9, 12))
+        self.repo.delete(self.repo.list_all()[0].id)
+        self.assertEqual(self.repo.generate_recurring_expenses(date(2026, 9, 20)), 0)
+        self.assertEqual(len(self.repo.list_subscriptions()), 1)
+        self.assertEqual(self.repo.generate_recurring_expenses(date(2026, 10, 1)), 1)
+        history = self.repo.list_all()
+        self.repo.stop_subscription(self.repo.list_subscriptions()[0].id)
+        reopened = ExpenseRepository(self.path)
+        self.assertEqual(reopened.list_subscriptions(), [])
+        self.assertEqual(reopened.generate_recurring_expenses(date(2026, 11, 1)), 0)
+        self.assertEqual(reopened.list_all(), history)
+
+    def test_concurrent_startups_do_not_duplicate_charges(self):
+        self.repo.add(100, "Cloud", date(2026, 8, 31), "Cloud", recurring=True)
+        def launch(_):
+            return ExpenseRepository(self.path).generate_recurring_expenses(date(2026, 9, 12))
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            generated = list(executor.map(launch, range(2)))
+        self.assertEqual(sorted(generated), [0, 1])
+        self.assertEqual(len(self.repo.list_all()), 2)
+
+    def test_recurring_migration_preserves_old_data(self):
+        legacy_path = self.path.with_name("legacy.db")
+        with closing(sqlite3.connect(legacy_path)) as connection, connection:
+            connection.executescript("""
+                CREATE TABLE expenses(id INTEGER PRIMARY KEY, amount_paise INTEGER,
+                    category TEXT, spent_on TEXT, description TEXT);
+                INSERT INTO expenses VALUES (7, 250050, 'Food', '2026-08-31', 'Old expense');
+                CREATE TABLE budget(id INTEGER PRIMARY KEY, amount_paise INTEGER);
+                INSERT INTO budget VALUES (1, 500000);
+                CREATE TABLE preferences(id INTEGER PRIMARY KEY, theme TEXT);
+                INSERT INTO preferences VALUES (1, 'dark');
+            """)
+        migrated = ExpenseRepository(legacy_path)
+        old = migrated.list_all()[0]
+        self.assertEqual((old.id, old.amount_paise, old.description), (7, 250050, "Old expense"))
+        self.assertIsNone(old.subscription_id)
+        self.assertEqual(migrated.get_budget(), 500000)
+        self.assertEqual(migrated.get_theme(), "dark")
+        self.assertEqual(migrated.generate_recurring_expenses(date(2026, 9, 1)), 0)
+        self.assertEqual(ExpenseRepository(legacy_path).list_all(), [old])
+
+    def test_recurring_insertion_and_generation_are_atomic(self):
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("""CREATE TRIGGER fail_expense BEFORE INSERT ON expenses
+                BEGIN SELECT RAISE(ABORT, 'Test failure'); END""")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.repo.add(100, "AI", date(2026, 8, 1), "AI", recurring=True)
+        self.assertEqual(self.repo.list_subscriptions(), [])
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("DROP TRIGGER fail_expense")
+        self.repo.add(100, "AI", date(2026, 8, 1), "AI", recurring=True)
+        self.repo.add(200, "Cloud", date(2026, 8, 1), "Cloud", recurring=True)
+        original = self.repo.list_all()
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("""CREATE TRIGGER fail_expense BEFORE INSERT ON expenses
+                WHEN NEW.category = 'Cloud' BEGIN SELECT RAISE(ABORT, 'Test failure'); END""")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.repo.generate_recurring_expenses(date(2026, 9, 1))
+        self.assertEqual(self.repo.list_all(), original)
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("DROP TRIGGER fail_expense")
+        self.assertEqual(self.repo.generate_recurring_expenses(date(2026, 9, 1)), 2)
+
+    def test_main_generates_subscriptions_before_building_dashboard(self):
+        self.repo.add(10000, "AI", date(2026, 8, 15), "AI plan", recurring=True)
+        page = Mock(spec=ft.Page)
+        page.window = Mock()
+        app = ExpenseTracker(page, self.repo)
+        generate = self.repo.generate_recurring_expenses
+        with patch("main.ExpenseRepository", return_value=self.repo), \
+                patch("main.ExpenseTracker", return_value=app), \
+                patch.object(self.repo, "generate_recurring_expenses",
+                             side_effect=lambda: generate(date(2026, 9, 12))):
+            main(page)
+        self.assertEqual(app.total.value, "₹200.00")
+        self.assertEqual(app.budget_spent.value, "₹200.00")
+        self.assertEqual(app.category_amounts["AI"].value, "₹200.00")
+        self.assertEqual(app.subscription_count.value, "1 active")
+        self.assertEqual(self.repo.list_all()[0].spent_on, date(2026, 9, 1))
+        self.assertIn("Logged 1 subscription charge", app.status.value)
+
 
 class FletStartupTests(unittest.IsolatedAsyncioTestCase):
     async def test_mounted_page_startup_and_budget_updates(self):
@@ -469,6 +590,18 @@ class FletStartupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.expense_snackbar.content.value,
                              "Alert: You have exceeded your budget for this month!")
             self.assertTrue(connection.send_message.called)
+            app.recurring.value = True
+            app.amount.value = "5"
+            app.category.value = "Cloud"
+            app.description.value = "Monthly hosting"
+            app.add_expense(None)
+            self.assertFalse(app.recurring.value)
+            self.assertEqual(app.subscription_count.value, "1 active")
+            subscription = repository.list_subscriptions()[0]
+            self.assertEqual(subscription.description, "Monthly hosting")
+            self.assertIsNotNone(repository.list_all()[0].subscription_id)
+            app.stop_subscription(subscription)
+            self.assertEqual(app.subscription_count.value, "0 active")
 
 
 class CsvExportTests(unittest.IsolatedAsyncioTestCase):
