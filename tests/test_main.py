@@ -3,6 +3,7 @@
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from datetime import date
 from pathlib import Path
 from unittest.mock import Mock
@@ -106,6 +107,113 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(app.description.value, "Keep this")
         self.assertIn("Could not save", app.status.value)
         self.assertEqual(self.repo.list_all(), [])
+
+    def test_budget_survives_restart_and_updates_one_record(self):
+        self.assertIsNone(self.repo.get_budget())
+        self.repo.set_budget(12345678)
+        reopened = ExpenseRepository(self.path)
+        self.assertEqual(reopened.get_budget(), 12345678)
+        reopened.set_budget(250000)
+        self.assertEqual(self.repo.get_budget(), 250000)
+        with closing(sqlite3.connect(self.path)) as connection:
+            self.assertEqual(connection.execute("SELECT count(*) FROM budget").fetchone()[0], 1)
+        reopened.set_budget(0)
+        self.assertEqual(ExpenseRepository(self.path).get_budget(), 0)
+
+    def test_migration_preserves_existing_expenses(self):
+        self.repo.add(125050, "Food", date(2026, 9, 12), "Existing expense")
+        original = self.repo.list_all()
+        with closing(sqlite3.connect(self.path)) as connection, connection:
+            connection.execute("DROP TABLE budget")  # Original app's schema.
+        migrated = ExpenseRepository(self.path)
+        self.assertEqual(migrated.list_all(), original)
+        self.assertIsNone(migrated.get_budget())
+        migrated.set_budget(500000)
+        self.assertEqual(ExpenseRepository(self.path).get_budget(), 500000)
+        self.assertEqual(migrated.list_all(), original)
+
+    def test_budget_validation_preserves_saved_value(self):
+        self.repo.set_budget(5000)
+        for amount in [-1, 1.5, True, 100000000000]:
+            with self.subTest(amount=amount):
+                with self.assertRaises(ValueError):
+                    self.repo.set_budget(amount)
+        app = ExpenseTracker(Mock(spec=ft.Page), self.repo)
+        for value in ["", "-10", "1.001", "NaN", "1e3", "1000000000"]:
+            with self.subTest(value=value):
+                app.budget_amount.value = value
+                app.save_budget(None)
+                self.assertIsNotNone(app.budget_amount.error)
+                self.assertEqual(self.repo.get_budget(), 5000)
+        app.budget_amount.value = "0"
+        app.save_budget(None)
+        self.assertIsNone(app.budget_amount.error)
+        self.assertEqual(self.repo.get_budget(), 0)
+        self.assertEqual(app.progress.value, 0)
+
+    def test_budget_dashboard_tracks_expenses_and_excess_spending(self):
+        app = ExpenseTracker(Mock(spec=ft.Page), self.repo)
+        app.build()
+        self.assertEqual(app.tabs.length, 2)
+        self.assertEqual(app.tabs.selected_index, 0)
+        self.assertEqual(app.progress.value, 0)
+        self.assertIn("No budget set", app.utilization.value)
+        app.budget_amount.value = "100.00"
+        app.save_budget(None)
+        self.assertEqual(app.budget_total.value, "₹100.00")
+        self.assertEqual(app.remaining.value, "₹100.00")
+        app.amount.value = "25.00"
+        app.add_expense(None)
+        self.assertEqual(app.budget_spent.value, "₹25.00")
+        self.assertEqual(app.remaining.value, "₹75.00")
+        self.assertEqual(app.progress.value, 0.25)
+        self.assertIn("25.0%", app.utilization.value)
+        # Preserve an unsaved budget edit when another tab changes expenses.
+        app.budget_amount.value = "200.00"
+        app.amount.value = "100.00"
+        app.add_expense(None)
+        self.assertEqual(app.budget_amount.value, "200.00")
+        self.assertEqual(app.remaining.value, "−₹25.00")
+        self.assertEqual(app.progress.value, 1)
+        self.assertIn("125.0%", app.utilization.value)
+        self.assertIn("Over budget by ₹25.00", app.utilization.value)
+        app.delete_expense(self.repo.list_all()[0])
+        self.assertEqual(app.remaining.value, "₹75.00")
+        self.assertEqual(app.progress.value, 0.25)
+        app.save_budget(None)
+        self.assertEqual(app.remaining.value, "₹175.00")
+        self.assertEqual(app.progress.value, 0.125)
+        restarted = ExpenseTracker(Mock(spec=ft.Page), ExpenseRepository(self.path))
+        restarted.build()
+        self.assertEqual(restarted.budget_amount.value, "200.00")
+        self.assertEqual(restarted.remaining.value, "₹175.00")
+
+    def test_zero_and_exactly_exhausted_budget(self):
+        app = ExpenseTracker(Mock(spec=ft.Page), self.repo)
+        app.update_budget_summary(1000, 1000)
+        self.assertEqual(app.remaining.value, "₹0.00")
+        self.assertEqual(app.progress.value, 1)
+        self.assertIn("Budget fully utilized", app.utilization.value)
+        app.update_budget_summary(0, 1000)
+        self.assertEqual(app.remaining.value, "−₹10.00")
+        self.assertEqual(app.progress.value, 1)
+        self.assertIn("Over budget by ₹10.00", app.utilization.value)
+        app.update_budget_summary(0, 0)
+        self.assertEqual(app.progress.value, 0)
+        self.assertEqual(app.remaining.value, "₹0.00")
+
+    def test_failed_budget_save_preserves_form_and_database(self):
+        self.repo.set_budget(10000)
+        app = ExpenseTracker(Mock(spec=ft.Page), self.repo)
+        app.build()
+        app.budget_amount.value = "200.00"
+        self.repo.set_budget = Mock(side_effect=sqlite3.OperationalError("locked"))
+        with self.assertLogs(level="ERROR"):
+            app.save_budget(None)
+        self.assertEqual(app.budget_amount.value, "200.00")
+        self.assertEqual(app.budget_total.value, "₹100.00")
+        self.assertEqual(self.repo.get_budget(), 10000)
+        self.assertIn("Could not save the budget", app.status.value)
 
 
 if __name__ == "__main__":

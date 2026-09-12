@@ -21,14 +21,16 @@ INK = "#173B37"
 MUTED = "#647773"
 
 
-def parse_amount(value: str) -> int:
+def parse_amount(value: str, *, allow_zero: bool = False) -> int:
     """Validate decimal rupees and convert to exact integer paise."""
     value = value.strip()
     if len(value) > 12 or not re.fullmatch(r"[0-9]+(?:\.[0-9]{1,2})?", value):
         raise ValueError("Enter an amount like 250 or 250.50 (no commas).")
     paise = int(Decimal(value) * 100)
-    if not 0 < paise <= MAX_AMOUNT_PAISE:
-        raise ValueError("Enter an amount from ₹0.01 to ₹99,99,99,999.99.")
+    minimum = 0 if allow_zero else 1
+    if not minimum <= paise <= MAX_AMOUNT_PAISE:
+        raise ValueError(f"Enter an amount from {format_inr(minimum)} "
+                         "to ₹99,99,99,999.99.")
     return paise
 
 
@@ -83,6 +85,34 @@ class ExpenseRepository:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS expenses_date_idx "
                 "ON expenses(spent_on DESC, id DESC)"
+            )
+            # Additive migration: existing expense records remain untouched.
+            connection.execute(
+                f"""CREATE TABLE IF NOT EXISTS budget (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    amount_paise INTEGER NOT NULL CHECK(
+                        typeof(amount_paise) = 'integer' AND
+                        amount_paise >= 0 AND amount_paise <= {MAX_AMOUNT_PAISE}
+                    )
+                )"""
+            )
+
+    def get_budget(self) -> int | None:
+        """Return the all-time budget in paise, or None before it is set."""
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT amount_paise FROM budget WHERE id = 1"
+            ).fetchone()
+        return row["amount_paise"] if row else None
+
+    def set_budget(self, amount_paise: int) -> None:
+        if type(amount_paise) is not int or not 0 <= amount_paise <= MAX_AMOUNT_PAISE:
+            raise ValueError("Invalid budget amount.")
+        with closing(self._connect()) as connection, connection:
+            connection.execute(
+                "INSERT INTO budget(id, amount_paise) VALUES (1, ?) "
+                "ON CONFLICT(id) DO UPDATE SET amount_paise = excluded.amount_paise",
+                (amount_paise,),
             )
 
     def _connect(self) -> sqlite3.Connection:
@@ -155,6 +185,21 @@ class ExpenseTracker:
         self.history_count = ft.Text("", color=MUTED, size=12)
         self.history = ft.ListView(height=470, spacing=10)
         self.status = ft.Text("", size=13, visible=False)
+        self.budget_amount = ft.TextField(
+            label="Total budget", prefix="₹ ", hint_text="e.g. 25000.00",
+            keyboard_type=ft.KeyboardType.NUMBER, on_submit=self.save_budget,
+        )
+        self.budget_total = ft.Text(size=28, weight=ft.FontWeight.BOLD,
+                                    color=INK, selectable=True)
+        self.budget_spent = ft.Text(size=28, weight=ft.FontWeight.BOLD,
+                                    color=INK, selectable=True)
+        self.remaining = ft.Text(size=28, weight=ft.FontWeight.BOLD,
+                                 color=TEAL, selectable=True)
+        self.utilization = ft.Text(color=MUTED)
+        self.progress = ft.ProgressBar(
+            value=0, color=TEAL, bgcolor="#DDEFE9", bar_height=12,
+            border_radius=6, semantics_label="Budget utilized",
+        )
 
     @staticmethod
     def panel(content: ft.Control, col: dict) -> ft.Container:
@@ -193,8 +238,36 @@ class ExpenseTracker:
                 ft.Divider(color="#E8EFEC"), self.history,
             ], spacing=14), {"xs": 12, "md": 7, "lg": 8},
         )
+        expenses_screen = ft.Column([
+            ft.Container(
+                bgcolor=TEAL, border_radius=20, padding=28,
+                content=ft.Column([
+                    ft.Text("TOTAL SPENT · ALL TIME", size=12,
+                            weight=ft.FontWeight.W_600, color="#C4E9E2"),
+                    self.total, self.count,
+                ], spacing=9),
+            ),
+            ft.ResponsiveRow([form, history], spacing=20, run_spacing=20),
+        ], spacing=24, scroll=ft.ScrollMode.AUTO)
+        self.tabs = ft.Tabs(
+            length=2, selected_index=0, expand=True,
+            content=ft.Column([
+                ft.TabBar(
+                    tabs=[
+                        ft.Tab(label="Expenses", icon=ft.Icons.RECEIPT_LONG_OUTLINED),
+                        ft.Tab(label="Budget", icon=ft.Icons.ACCOUNT_BALANCE_WALLET_OUTLINED),
+                    ],
+                    label_color=TEAL, indicator_color=TEAL,
+                    unselected_label_color=MUTED,
+                ),
+                ft.TabBarView(
+                    controls=[expenses_screen, self.build_budget_screen()], expand=True,
+                ),
+            ], spacing=20, expand=True),
+        )
         self.page.add(ft.Container(
-            width=1200, padding=ft.Padding.symmetric(horizontal=24, vertical=28),
+            width=1200, expand=True,
+            padding=ft.Padding.symmetric(horizontal=24, vertical=28),
             content=ft.Column([
                 ft.Row([
                     ft.Container(
@@ -208,21 +281,96 @@ class ExpenseTracker:
                         ft.Text("Every rupee, accounted for.", color=MUTED, size=14),
                     ], spacing=3, expand=True),
                 ], spacing=14),
-                ft.Container(
-                    bgcolor=TEAL, border_radius=20, padding=28,
-                    content=ft.Column([
-                        ft.Text("TOTAL SPENT · ALL TIME", size=12,
-                                weight=ft.FontWeight.W_600, color="#C4E9E2"),
-                        self.total, self.count,
-                    ], spacing=9),
-                ),
                 self.status,
-                ft.ResponsiveRow([form, history], spacing=20, run_spacing=20),
+                self.tabs,
                 ft.Text("Saved on this Mac · SQLite local storage",
                         size=12, color=MUTED),
-            ], spacing=24),
+            ], spacing=24, expand=True),
         ))
-        self.refresh()
+        self.refresh(update_budget_input=True)
+
+    def build_budget_screen(self) -> ft.Column:
+        summary_cards = [
+            self.panel(ft.Column([
+                ft.Text(label, color=MUTED, size=13), value,
+            ], spacing=12), {"xs": 12, "md": 4})
+            for label, value in [
+                ("Total Budget", self.budget_total),
+                ("Total Spent", self.budget_spent),
+                ("Remaining Balance", self.remaining),
+            ]
+        ]
+        return ft.Column([
+            ft.Text("Your budget", size=24, weight=ft.FontWeight.BOLD, color=INK),
+            ft.Text("One total budget for all recorded expenses, across all dates.",
+                    color=MUTED),
+            ft.ResponsiveRow(summary_cards, spacing=16, run_spacing=16),
+            self.panel(ft.Column([
+                ft.Text("Budget utilization", size=18, weight=ft.FontWeight.W_600,
+                        color=INK),
+                self.progress, self.utilization,
+            ], spacing=16), {"xs": 12}),
+            self.panel(ft.Column([
+                ft.Text("Set or update your budget", size=20,
+                        weight=ft.FontWeight.BOLD, color=INK),
+                ft.Text("This replaces your total budget. Enter 0 if no funds are available.",
+                        color=MUTED, size=13),
+                self.budget_amount,
+                ft.FilledButton(
+                    content="Save budget", icon=ft.Icons.SAVE_OUTLINED,
+                    height=48, on_click=self.save_budget,
+                    style=ft.ButtonStyle(bgcolor=TEAL, color=ft.Colors.WHITE),
+                ),
+            ], spacing=16), {"xs": 12}),
+        ], spacing=20, scroll=ft.ScrollMode.AUTO)
+
+    def save_budget(self, _event: ft.Event) -> None:
+        self.budget_amount.error = None
+        self.status.visible = False
+        try:
+            amount = parse_amount(self.budget_amount.value or "", allow_zero=True)
+        except ValueError as error:
+            self.budget_amount.error = str(error)
+            self.page.update()
+            return
+        try:
+            self.repository.set_budget(amount)
+        except sqlite3.Error:
+            logging.exception("Could not save budget")
+            self.notify("Could not save the budget. Please try again.", error=True)
+            return
+        if self.refresh(update_budget_input=True):
+            self.notify("Budget saved.")
+
+    def update_budget_summary(self, budget: int | None, spent: int) -> None:
+        remaining = (budget or 0) - spent
+        self.budget_total.value = format_inr(budget or 0)
+        self.budget_spent.value = format_inr(spent)
+        self.remaining.value = format_inr(remaining)
+        self.remaining.color = "#B3261E" if remaining < 0 else TEAL
+        self.progress.color = "#B3261E" if budget is not None and spent > budget else TEAL
+        if budget is None:
+            self.progress.value = 0
+            message = "No budget set yet. Save a budget to track utilization."
+        elif budget == 0:
+            self.progress.value = 1 if spent else 0
+            message = "No funds available in your budget."
+            if spent:
+                message += f" Over budget by {format_inr(spent)}."
+        else:
+            ratio = spent / budget
+            self.progress.value = min(ratio, 1.0)
+            # Keep the true percentage even when the visual bar is full.
+            percentage = Decimal(spent) * 100 / Decimal(budget)
+            message = f"{percentage:.1f}% of budget utilized"
+            if remaining < 0:
+                message += f" · Over budget by {format_inr(-remaining)}"
+            elif remaining == 0:
+                message += " · Budget fully utilized"
+            else:
+                message += f" · {format_inr(remaining)} available"
+        self.utilization.value = message
+        self.progress.semantics_value = message
 
     def notify(self, message: str, error: bool = False) -> None:
         self.status.value = message
@@ -315,14 +463,22 @@ class ExpenseTracker:
             ], spacing=4),
         )
 
-    def refresh(self) -> bool:
+    def refresh(self, *, update_budget_input: bool = False) -> bool:
         try:
             expenses = self.repository.list_all()
+            budget = self.repository.get_budget()
         except sqlite3.Error:
-            logging.exception("Could not load expenses")
-            self.notify("Could not load expenses. Restart the app to retry.", error=True)
+            logging.exception("Could not load expenses or budget")
+            self.notify("Could not load expenses or budget. Restart the app to retry.",
+                        error=True)
             return False
-        self.total.value = format_inr(sum(item.amount_paise for item in expenses))
+        spent = sum(item.amount_paise for item in expenses)
+        self.total.value = format_inr(spent)
+        self.update_budget_summary(budget, spent)
+        if update_budget_input:
+            self.budget_amount.value = (
+                f"{budget // 100}.{budget % 100:02d}" if budget is not None else ""
+            )
         count = len(expenses)
         self.count.value = f"{count} expense{'s' if count != 1 else ''} recorded"
         self.history_count.value = f"{count} total"
@@ -349,7 +505,8 @@ def main(page: ft.Page) -> None:
     page.theme = ft.Theme(color_scheme_seed=TEAL)
     page.bgcolor = "#F0F5F2"
     page.padding = 0
-    page.scroll = ft.ScrollMode.AUTO
+    # TabBarView needs bounded height; each tab handles its own scrolling.
+    page.scroll = None
     page.horizontal_alignment = ft.CrossAxisAlignment.CENTER
     page.window.width = 1180
     page.window.height = 900
